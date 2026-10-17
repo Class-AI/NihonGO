@@ -1,0 +1,139 @@
+// Builds src/data/unitNN.ts / reading-extra.ts / listening-extra.ts from compact sources in scripts/content/.
+// Authors write only the Japanese sentence; this script adds the hiragana reading (kuromoji, spaced by phrase).
+// Run: node scripts/gen-units.mjs
+import fs from "node:fs";
+import path from "node:path";
+import { createRequire } from "node:module";
+import { pathToFileURL } from "node:url";
+
+const require = createRequire(import.meta.url);
+const kuromoji = require("kuromoji");
+const { toHiragana } = require("wanakana");
+
+const tk = await new Promise((res, rej) =>
+  kuromoji.builder({ dicPath: path.join(process.cwd(), "node_modules", "kuromoji", "dict") }).build((e, t) => (e ? rej(e) : res(t))),
+);
+
+const KATAKANA = /^[\u30A0-\u30FFー]+$/;
+const ATTACH_POS = new Set(["助詞", "助動詞", "記号"]);
+
+/** hiragana reading with spaces between phrases, particles/auxiliaries attached to the previous word */
+/** Known IPADIC misreadings, corrected from context (checked against the hand-verified readings of sets 1-14). */
+function fixReading(tokens, i, r) {
+  const t = tokens[i];
+  const s = t.surface_form;
+  const prev = tokens[i - 1]?.surface_form ?? "";
+  const next = tokens[i + 1]?.surface_form ?? "";
+  if (s === "間") return "アイダ"; // 〜ている間に (not ま)
+  if (s === "一人") return "ヒトリ";
+  if (s === "二人") return "フタリ";
+  if (s === "一" && next === "人") return "ヒト"; // 一人 = ひとり
+  if (s === "二" && next === "人") return "フタ"; // 二人 = ふたり
+  if (s === "人" && prev === "一") return "リ";
+  if (s === "人" && prev === "二") return "リ";
+  if (s === "一晩") return "ヒトバン";
+  if (s === "一晩中") return "ヒトバンジュウ";
+  if (s === "一" && next.startsWith("晩")) return "ヒト";
+  if (s === "夜" && next.startsWith("更")) return "ヨ"; // 夜更かし = よふかし
+  if (s === "日本") return "ニホン";
+  if (s === "日本人") return "ニホンジン";
+  if (s === "辛い") return "カライ";
+  if (s === "辛") return "カラ";
+  if (s === "他") return "ホカ";
+  if (s === "後" && !/^[ごゴ]/.test(r)) return "アト";
+  if (s === "今" && !/^[日回度年月週朝夜晩後]/.test(next)) return "イマ";
+  if (s === "十分" && next.startsWith("おき")) return "ジュッポン".replace("ポン", "プン");
+  if (s === "中" && /[日晩年週夜朝]$/.test(prev)) return "ジュウ";
+  if (t.basic_form === "開く" && prev !== "を") return r.replace(/^ヒラ/, "ア");
+  if (s === "今日中") return "キョウジュウ";
+  return r;
+}
+
+export function readingOf(text) {
+  const parts = [];
+  const tokens = tk.tokenize(text);
+  for (let i = 0; i < tokens.length; i++) {
+    const t = tokens[i];
+    let r = t.reading && t.reading !== "*" ? t.reading : t.surface_form;
+    r = fixReading(tokens, i, r);
+    if (KATAKANA.test(t.surface_form)) r = t.surface_form; // keep long-vowel marks of loanwords
+    const h = toHiragana(r, { passRomaji: true, convertLongVowelMark: false });
+    const attach = ATTACH_POS.has(t.pos) || (t.pos === "動詞" && (t.pos_detail_1 === "非自立" || t.pos_detail_1 === "接尾")) || (t.pos === "名詞" && t.pos_detail_1 === "接尾");
+    if (parts.length && attach) parts[parts.length - 1] += h;
+    else parts.push(h);
+  }
+  return parts.join(" ");
+}
+
+const out = (file, header, body) => {
+  fs.writeFileSync(file, header + body + "\n");
+  console.log("wrote", file, `(${(fs.statSync(file).size / 1024).toFixed(0)} KB)`);
+};
+const json = (v) => JSON.stringify(v, null, 1).replace(/\n\s*/g, " ").replace(/\[ /g, "[").replace(/ \]/g, "]").replace(/\{ /g, "{ ").replace(/ \}/g, " }");
+
+const dir = path.join(process.cwd(), "scripts", "content");
+const files = fs.readdirSync(dir).filter((f) => /^blk\d+\.mjs$/.test(f)).sort();
+for (const f of files) {
+  const { default: b } = await import(pathToFileURL(path.join(dir, f)).href);
+  const unit = {
+    id: b.id,
+    level: b.level,
+    title: b.title,
+    grammar: b.grammar.map((g) => ({
+      id: g.id,
+      level: b.level,
+      title: g.title,
+      meaning: g.meaning,
+      formation: g.formation,
+      explanation: g.explanation,
+      check: g.check,
+      tamil: g.tamil,
+      ...(g.tips ? { tips: g.tips } : {}),
+      examples: g.ex.map(([jp, en]) => [jp, readingOf(jp), en]),
+      quiz: g.quiz,
+      speaking: g.say.map(([en, jp]) => [en, jp, readingOf(jp)]),
+    })),
+    review: b.review.map(([en, jp]) => [en, jp, readingOf(jp)]),
+  };
+  out(
+    path.join("src", "data", `unit${b.id}.ts`),
+    `// AUTO-GENERATED from scripts/content/${f} by scripts/gen-units.mjs (readings come from the kuromoji dictionary).\nimport type { Unit } from "@/lib/types";\n\nexport const unit${b.id}: Unit = `,
+    json(unit) + ";",
+  );
+}
+
+// reading passages and listening scripts
+const extra = path.join(dir, "extra.mjs");
+if (fs.existsSync(extra)) {
+  const { reading: R, listening: L } = await import(pathToFileURL(extra).href);
+  const reading = R.map((s) => ({
+    id: s.id, level: s.level, title: s.title, kind: s.kind,
+    passage: s.passage, reading: s.passage.map(readingOf), tamil: s.tamil,
+    vocab: s.vocab.map(([jp, en]) => [jp, readingOf(jp).replace(/ /g, ""), en]),
+    questions: s.questions,
+  }));
+  out(path.join("src", "data", "reading-extra.ts"),
+    `// AUTO-GENERATED by scripts/gen-units.mjs from scripts/content/extra.mjs\nimport type { ReadingSet } from "./reading";\n\nexport const extraReading: ReadingSet[] = `, json(reading) + ";");
+  const listening = L.map((s) => ({
+    id: s.id, level: s.level, title: s.title, kind: s.kind,
+    script: s.script, reading: s.script.map(([, t]) => readingOf(t)), tamil: s.tamil, questions: s.questions,
+  }));
+  out(path.join("src", "data", "listening-extra.ts"),
+    `// AUTO-GENERATED by scripts/gen-units.mjs from scripts/content/extra.mjs\nimport type { ListeningSet } from "./listening";\n\nexport const extraListening: ListeningSet[] = `, json(listening) + ";");
+}
+
+// rewritten combined exams for the hand-written sets 7-14
+const revFile = path.join(dir, "reviews.mjs");
+if (fs.existsSync(revFile)) {
+  const { default: REV } = await import(pathToFileURL(revFile).href);
+  for (const [id, rows] of Object.entries(REV)) {
+    const f = path.join("src", "data", `unit${id}.ts`);
+    let src = fs.readFileSync(f, "utf8");
+    const at = src.lastIndexOf("\n  review: [");
+    if (at < 0) throw new Error("no review block in " + f);
+    const triples = rows.map(([en, jp]) => [en, jp, readingOf(jp)]);
+    src = src.slice(0, at) + "\n  review: " + json(triples) + ",\n};\n";
+    fs.writeFileSync(f, src);
+    console.log("rewrote combined exam of", f);
+  }
+}
